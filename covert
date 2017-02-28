@@ -1,0 +1,603 @@
+#!/bin/sh
+# Covert, yet another management tool for Docker secret
+# Simplify bulk service secret rotation with time-based secret versioning
+# Copyright (c) 2017 Fadhli Dzil Ikram
+
+# Define script version
+SCRIPT_VERSION="v0.1.0"
+# Get program name if invoked from absolute path
+PROG=$( basename "$0" )
+
+# Print string to STDERR, then exit script with code 1
+error() {
+	echo "$1" >&2
+	exit 1
+}
+
+# Print bad option error
+bad_option() {
+	error "Bad option '${1%%=*}'"
+}
+
+bad_option_arg() {
+	error "Bad argument for option '${1%%=*}'"
+}
+
+# Decompose multiple concatenated short opts (e.g. -axfz to -a -x -f -z)
+multi() {
+	MULTI=""
+	for _opt in $( echo "${1#-}" | grep -o . ); do
+		MULTI="$MULTI -$_opt"
+	done
+}
+
+# Filter all secret version from specified secret name
+filter_version() {
+	grep -woE "[0-9]+-$( echo $1 | sed 's/\./\\./g' )"
+}
+
+# Only match and return exit status
+match_version() {
+	grep -wqE "[0-9]+-$( echo $1 | sed 's/\./\\./g' )"
+}
+
+# Find secret version from specified service and secret name
+raw_active() {
+	docker service inspect -f \
+	'{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{println .SecretName}}{{end}}' \
+	"$1" | sed '/^$/d'
+}
+
+match_active() {
+	raw_active "$2" | match_version "$1"
+}
+
+get_active() {
+	raw_active "$2" | filter_version "$1" | head -n 1
+}
+
+raw_secret() {
+	docker secret ls
+}
+
+match_secret() {
+	raw_secret | match_version "$1"
+}
+
+get_secret() {
+	raw_secret | filter_version "$1" | sort -nr
+}
+
+latest_secret() {
+	get_secret "$1" | head -n 1
+}
+
+outdated_secret() {
+	get_secret "$1" | tail -n +2
+}
+
+# Commit command processor
+secret_commit() {
+	usage() {
+		echo "Usage:  $PROG commit [OPTIONS] SECRET"
+		echo
+		echo "Commit new secret version to Docker secret. If SECRET defined as absolute file"
+		echo "path, the secret name will be the path basename."
+		echo
+		echo "Options:"
+		echo "-h, --help    Print help message"
+		echo "-i, --stdin   Use STDIN as secret commit source"
+	}
+
+	# Options parser
+	OPT_STDIN=""
+
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		-i|--stdin)
+			OPT_STDIN=1
+			;;
+		--)
+			shift 1
+			break
+			;;
+		-?|--*)
+			bad_option "$1"
+			;;
+		-?*)
+			multi "$1"
+			shift 1
+			set -- $MULTI "$@"
+			continue
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Argument parser
+	if [ -z "$1" ]; then
+		error "Missing required arg SECRET"
+	fi
+
+	# Set file argument for `docker secret create`
+	if [ -n "$OPT_STDIN" ]; then
+		FILE="-"
+	else
+		FILE="$1"
+		# Check if file path exists
+		if ! [ -r "$FILE" ]; then
+			error "File path not found '$FILE'"
+		fi
+	fi
+	# Get secret base name and version name
+	BASE_NAME=$( basename "$1" )
+	COMMIT_NAME="$( date +%s )-$BASE_NAME"
+	# Add secret to docker
+	if ! ERROR=$( docker secret create "$COMMIT_NAME" "$FILE" 2>&1 ); then
+		error "$ERROR"
+	fi
+	# Tell user the commit name
+	echo "$COMMIT_NAME"
+}
+
+# Clean and purge command processor
+secret_rm() {
+	usage() {
+		echo "Usage:  $PROG $COMMAND [OPTIONS] SECRET [SECRET...]"
+		echo
+		if [ "$COMMAND" = "clean" ]; then
+		echo "Keep latest secret and remove all older secret version from Docker secret."
+		else
+		echo "Remove all secret versions from Docker secret."
+		fi
+		echo
+		echo "Options:"
+		echo "-h, --help   Print help message"
+	}
+
+	# Options parser
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		--)
+			shift 1
+			break
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Argument parser
+	if [ -z "$1" ]; then
+		error "Missing required arg SECRET"
+	fi
+
+	# Sanity checks before actual cleanup
+	for SECRET in "$@"; do
+		if ! match_secret "$SECRET"; then
+			error "Secret not found '$SECRET'"
+		fi
+	done
+
+	# Iterate every secret
+	for SECRET in "$@"; do
+		# Get secrets to remove
+		if [ "$COMMAND" = "clean" ]; then
+			CLEANUP=$( outdated_secret "$SECRET" )
+			# Check if there is a thing to clean up
+			if [ -z "$CLEANUP" ]; then
+				echo "No outdated secret '$SECRET'" >&2
+				continue
+			fi
+		else
+			CLEANUP=$( get_secret "$SECRET" )
+		fi
+		# Cleanup secrets
+		for ITEM in $CLEANUP; do
+			if ! ERROR=$( docker secret rm $ITEM 2>&1 ); then
+				error "$ERROR"
+			fi
+			echo "$ITEM"
+		done
+	done
+}
+
+# Latest command processor
+secret_latest() {
+	usage() {
+		echo "Usage:  $PROG $COMMAND [OPTIONS] SECRET"
+		echo
+		echo "Get the latest secret version name."
+		echo
+		echo "Options:"
+		echo "-h, --help   Print help message"
+	}
+
+	# Options parser
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		--)
+			shift 1
+			break
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Argument parser
+	if [ -z "$1" ]; then
+		error "Missing required arg SECRET"
+	fi
+
+	# Get latest name
+	LATEST=$( latest_secret "$1" )
+	if [ -z "$LATEST" ]; then
+		error "Secret not found '$1'"
+	fi
+	echo "$LATEST"
+}
+
+# Service command processor
+service() {
+	usage() {
+		echo "Usage:  $PROG $COMMAND [OPTIONS] SERVICE"
+		echo
+		case "$COMMAND" in
+		add)
+		echo "Add new secret version to Docker service."
+		;;
+		update)
+		echo "Update secret on Docker service to the latest version."
+		;;
+		rm)
+		echo "Remove secret version from Docker service."
+		;;
+		esac
+		echo "At least one -s, --secret option is required to run the task."
+		echo
+		echo "Options:"
+		echo "-h, --help        Print help message"
+		echo "-s, --secret=[]   Secret name list"
+		if [ -n "$MODE_ADD" ]; then
+		echo "-g, --gid=0       Assign secret group to GID"
+		echo "    --mode=0644   Set file mode for secret"
+		echo "    --secure      Shorthand for --mode=0600, give secret access only to UID"
+		echo "-u, --uid=0       Assign secret user to UID"
+		fi
+	}
+
+	add_secret() {
+		SECRETS="$SECRETS$1 "
+	}
+
+	set_uid() {
+		OPT_UID="$1"
+	}
+
+	set_gid() {
+		OPT_GID="$1"
+	}
+
+	set_mode() {
+		OPT_MODE="$1"
+	}
+
+	check_command() {
+		if [ -z "$MODE_ADD" ]; then
+			bad_option "$1"
+		fi
+	}
+
+
+	# Get add-rm mode
+	case "$COMMAND" in
+	add)
+		MODE_ADD=1
+		MODE_RM=""
+		;;
+	update)
+		MODE_ADD=1
+		MODE_RM=1
+		;;
+	rm)
+		MODE_ADD=""
+		MODE_RM=1
+		;;
+	esac
+
+	# Options parser
+	SECRETS=""
+	OPT_GID="0"
+	OPT_UID="0"
+	OPT_MODE="0644"
+
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		--secure)
+			set_mode "0600"
+			;;
+
+		# Add secret
+		-s|--secret)
+			if [ -z "$2" ]; then
+				bad_option_arg "$1"
+			fi
+			add_secret "$2"
+			shift 1
+			;;
+		--secret=)
+			bad_option_arg "$1"
+			;;
+		--secret=*)
+			add_secret "${1#*=}"
+			;;
+		# Set UID
+		-u|--uid)
+			check_command "$1"
+			if [ -z "$2" ]; then
+				bad_option_arg "$1"
+			fi
+			set_uid "$2"
+			shift 1
+			;;
+		--uid=)
+			check_command "$1"
+			bad_option_arg "$1"
+			;;
+		--uid=*)
+			check_command "$1"
+			set_uid "${1#*=}"
+			;;
+		# Set GID
+		-g|--gid)
+			check_command "$1"
+			if [ -z "$2" ]; then
+				bad_option_arg "$1"
+			fi
+			set_gid "$2"
+			shift 1
+			;;
+		--gid=)
+			check_command "$1"
+			bad_option_arg "$1"
+			;;
+		--gid=*)
+			check_command "$1"
+			set_gid "${1#*=}"
+			;;
+		# Set mode
+		--mode)
+			check_command "$1"
+			if [ -z "$2" ]; then
+				bad_option_arg "$1"
+			fi
+			set_mode "$2"
+			shift 1
+			;;
+		--mode=)
+			check_command "$1"
+			bad_option_arg "$1"
+			;;
+		--mode=*)
+			check_command "$1"
+			set_mode "${1#*=}"
+			;;
+
+		--)
+			shift 1
+			break
+			;;
+		-?|--*)
+			bad_option "$1"
+			;;
+		-?*)
+			multi "$1"
+			shift 1
+			set -- $MULTI "$@"
+			continue
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Argument parser
+	if [ -z "$1" ]; then
+		error "Missing required arg SERVICE"
+	fi
+	# Check for required secret (-s) option
+	if [ -z "$SECRETS" ]; then
+		error "Missing required option -s, --secret"
+	fi
+
+	UPDATE_ARGS=""
+	for SECRET in $SECRETS; do
+		# Do add mode
+		if [ -n "$MODE_ADD" ]; then
+			LATEST=$( latest_secret "$SECRET" )
+			if [ -z "$LATEST" ]; then
+				error "Secret not found '$SECRET'"
+			fi
+			UPDATE_ARGS="$UPDATE_ARGS--secret-add source=$LATEST,target=$SECRET,uid=$OPT_UID,gid=$OPT_GID,mode=$OPT_MODE "
+		fi
+		# Do rm mode
+		if [ -n "$MODE_RM" ]; then
+			ACTIVE=$( get_active "$SECRET" "$1" )
+			if [ -z "$ACTIVE" ]; then
+				error "Active secret not found '$SECRET'"
+			fi
+			UPDATE_ARGS="$UPDATE_ARGS--secret-rm $ACTIVE "
+		fi
+	done
+	# Run secret update
+	if ! ERROR=$( docker service update $UPDATE_ARGS -- "$1" 2>&1 ); then
+		error "$ERROR"
+	fi
+}
+
+# Active command processor
+service_active() {
+	usage() {
+		echo "Usage:  $PROG $COMMAND [OPTIONS] SECRET SERVICE"
+		echo
+		echo "Get active secret version from a service."
+		echo
+		echo "Options:"
+		echo "-h, --help   Print help message"
+	}
+
+	# Options parser
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		--)
+			shift 1
+			break
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Argument parser
+	if [ -z "$1" ]; then
+		error "Missing required arg SECRET"
+	fi
+	if [ -z "$2" ]; then
+		error "Missing required arg SERVICE"
+	fi
+
+	# Get latest name
+	ACTIVE=$( get_active "$1" "$2" )
+	if [ -z "$ACTIVE" ]; then
+		error "Active secret not found '$1'"
+	fi
+	echo "$ACTIVE"
+}
+
+# The script entrypoint function
+main() {
+	usage() {
+		echo "Usage:  $PROG [OPTIONS] COMMAND"
+		echo
+		echo "Yet another management tool for Docker secret"
+		echo
+		echo "Options:"
+		echo "-h, --help      Print help message"
+		echo "-v, --version   Print program version"
+		echo
+		echo "Service Management Commands:"
+		echo "add      Add latest secret version to a service"
+		echo "update   Update older secret version on a service to latest"
+		echo "rm       Remove secret version from a service"
+		echo "active   Get active secret version from a service"
+		echo
+		echo "Commands:"
+		echo "commit   Add new secret version to secret vault"
+		echo "clean    Remove all but latest secret version from secret vault"
+		echo "purge    Remove all secret version from secret vault"
+		echo "latest   Get the latest secret version name"
+		echo
+		echo "Run '$PROG COMMAND --help' for more information about a command"
+	}
+
+	version() {
+		echo "$SCRIPT_VERSION"
+	}
+
+	# Options parser
+	while [ -n "$*" ]; do
+		case "$1" in
+		-h|--help)
+			usage
+			exit
+			;;
+		-v|--version)
+			version
+			exit
+			;;
+		--)
+			shift 1
+			break
+			;;
+		-?|--*)
+			bad_option "$1"
+			;;
+		-?*)
+			multi "$1"
+			shift 1
+			set -- $MULTI "$@"
+			continue
+			;;
+		*)
+			break
+		esac
+		shift 1
+	done
+
+	# Command parser
+	COMMAND="$1"
+	shift 1
+	if [ -z "$COMMAND" ]; then
+		error "Missing required arg COMMAND"
+	fi
+
+	# Redirect each command to its command processor
+	case "$COMMAND" in
+	commit)
+		secret_commit "$@"
+		;;
+	clean)
+		secret_rm "$@"
+		;;
+	purge)
+		secret_rm "$@"
+		;;
+	latest)
+		secret_latest "$@"
+		;;
+	add)
+		service "$@"
+		;;
+	update)
+		service "$@"
+		;;
+	rm)
+		service "$@"
+		;;
+	active)
+		service_active "$@"
+		;;
+	*)
+		error "Unknown $PROG command '$COMMAND'"
+	esac
+}
+
+# Run main function
+main "$@"

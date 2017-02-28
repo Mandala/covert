@@ -563,10 +563,10 @@ main() {
 
 	# Command parser
 	COMMAND="$1"
-	shift 1
 	if [ -z "$COMMAND" ]; then
 		error "Missing required arg COMMAND"
 	fi
+	shift 1
 
 	# Redirect each command to its command processor
 	case "$COMMAND" in

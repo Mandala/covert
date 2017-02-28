@@ -273,18 +273,22 @@ service() {
 		echo "At least one -s, --secret option is required to run the task."
 		echo
 		echo "Options:"
-		echo "-h, --help        Print help message"
-		echo "-s, --secret=[]   Secret name list"
+		echo "-h, --help             Print help message"
+		echo "-s, --secret=[]        Secret name list"
 		if [ -n "$MODE_ADD" ]; then
-		echo "-g, --gid=0       Assign secret group to GID"
-		echo "    --mode=0644   Set file mode for secret"
-		echo "    --secure      Shorthand for --mode=0600, give secret access only to UID"
-		echo "-u, --uid=0       Assign secret user to UID"
+		echo "-g, --gid=0            Assign secret group to GID"
+		echo "    --mode=0644        Set file mode for secret"
+		echo "-x, --self-secret=[]   Override file mode to 0600 to prevent global read access"
+		echo "-u, --uid=0            Assign secret user to UID"
 		fi
 	}
 
 	add_secret() {
 		SECRETS="$SECRETS$1 "
+	}
+
+	add_self_secret() {
+		SELF_SECRETS="$SELF_SECRETS$1 "
 	}
 
 	set_uid() {
@@ -324,6 +328,7 @@ service() {
 
 	# Options parser
 	SECRETS=""
+	SELF_SECRETS=""
 	OPT_GID="0"
 	OPT_UID="0"
 	OPT_MODE="0644"
@@ -333,9 +338,6 @@ service() {
 		-h|--help)
 			usage
 			exit
-			;;
-		--secure)
-			set_mode "0600"
 			;;
 
 		# Add secret
@@ -351,6 +353,24 @@ service() {
 			;;
 		--secret=*)
 			add_secret "${1#*=}"
+			;;
+
+		# Add self-secret
+		-x|--self-secret)
+			check_command "$1"
+			if [ -z "$2" ]; then
+				bad_option_arg "$1"
+			fi
+			add_self_secret "$2"
+			shift 1
+			;;
+		--self-secret=)
+			check_command "$1"
+			bad_option_arg "$1"
+			;;
+		--self-secret=*)
+			check_command "$1"
+			add_self_secret "${1#*=}"
 			;;
 		# Set UID
 		-u|--uid)
@@ -432,24 +452,37 @@ service() {
 		error "Missing required option -s, --secret"
 	fi
 
-	UPDATE_ARGS=""
-	for SECRET in $SECRETS; do
-		# Do add mode
+	update_secret() {
+		# Do secret add
 		if [ -n "$MODE_ADD" ]; then
-			LATEST=$( latest_secret "$SECRET" )
+			LATEST=$( latest_secret "$1" )
 			if [ -z "$LATEST" ]; then
-				error "Secret not found '$SECRET'"
+				error "Secret not found '$1'"
 			fi
-			UPDATE_ARGS="$UPDATE_ARGS--secret-add source=$LATEST,target=$SECRET,uid=$OPT_UID,gid=$OPT_GID,mode=$OPT_MODE "
+			UPDATE_ARGS="$UPDATE_ARGS--secret-add source=$LATEST,target=$1,uid=$OPT_UID,gid=$OPT_GID,mode=$3 "
 		fi
-		# Do rm mode
+		# Do secret removal
 		if [ -n "$MODE_RM" ]; then
-			ACTIVE=$( get_active "$SECRET" "$1" )
+			ACTIVE=$( get_active "$1" "$2" )
 			if [ -z "$ACTIVE" ]; then
-				error "Active secret not found '$SECRET'"
+				error "Active secret not found '$1'"
 			fi
 			UPDATE_ARGS="$UPDATE_ARGS--secret-rm $ACTIVE "
 		fi
+		# Check if the active is the latest version to prevent self removal
+		if [ -n "$MODE_ADD" ] && [ -n "$MODE_RM" ] && [ "$LATEST" = "$ACTIVE" ] ; then
+			error "Secret '$1' already on the latest version"
+		fi
+	}
+
+	UPDATE_ARGS=""
+	# Add secret
+	for SECRET in $SECRETS; do
+		update_secret "$SECRET" "$1" "$OPT_MODE"
+	done
+	# Add self-secret
+	for SECRET in $SELF_SECRETS; do
+		update_secret "$SECRET" "$1" "0600"
 	done
 	# Run secret update
 	if ! ERROR=$( docker service update $UPDATE_ARGS -- "$1" 2>&1 ); then

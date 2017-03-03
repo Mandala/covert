@@ -5,9 +5,10 @@ Yet another management tool for Docker secret with time-based secret versioning.
 
 ## Installation
 
-Download the release source code and make the script available on your path
-by modifying your `$PATH` variable or put it somewhere like `/usr/bin` or
-`/usr/local/bin` so you can invoke the `covert` tool from any directories.
+Download the script from [project release page](https://github.com/withmandala/covert/releases)
+and make the script available on your path by modifying your `$PATH` variable or
+put it somewhere like `/usr/bin` or `/usr/local/bin` so you can invoke the
+`covert` tool from any directories.
 
 ## Usage
 
